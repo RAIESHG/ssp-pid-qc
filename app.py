@@ -217,12 +217,11 @@ If page is blank/border only: {{"extracted":{{"equipment_tags":[],"line_numbers"
 
 # ─── CORE: GEMINI API CALL ────────────────────────────────────────────────────
 def call_gemini(client, img_bytes, prompt, retries=2):
-    """Try each model in MODELS; on quota exhaustion fall through to the next."""
-    global MODEL
+    """Try each model in MODELS; on quota exhaustion fall through to the next.
+    Returns (result_dict, model_name_used)."""
     empty = {"extracted":{}, "issues":[]}
 
     for model in MODELS:
-        MODEL = model   # keep track of active model for display/export
         for attempt in range(retries):
             try:
                 resp = client.models.generate_content(
@@ -235,27 +234,26 @@ def call_gemini(client, img_bytes, prompt, retries=2):
                 raw = resp.text.strip().replace("```json","").replace("```","").strip()
                 s = raw.find("{"); e = raw.rfind("}")
                 if s == -1: raise ValueError("No JSON in response")
-                return json.loads(raw[s:e+1])
+                return json.loads(raw[s:e+1]), model
 
             except json.JSONDecodeError:
                 if attempt < retries - 1:
                     time.sleep(4)
                 else:
-                    return empty   # bad JSON even after retry — skip tile
+                    return empty, model
 
             except Exception as ex:
                 msg = str(ex)
                 is_quota = ("429" in msg or "quota" in msg.lower()
                             or "exhausted" in msg.lower() or "RESOURCE_EXHAUSTED" in msg)
                 if is_quota:
-                    # Break inner loop → try next model
-                    break
+                    break   # try next model
                 elif attempt < retries - 1:
                     time.sleep(5)
                 else:
-                    return empty   # non-quota error, give up
+                    return empty, model
 
-    return empty   # all models exhausted
+    return empty, MODELS[-1]   # all models exhausted
 
 # ─── CORE: DEDUPLICATION ──────────────────────────────────────────────────────
 def dedupe_issues(issues):
@@ -550,9 +548,7 @@ if run_btn and uploaded:
                     raise
         if not active_model:
             raise RuntimeError("All models exhausted or unavailable. Try again later.")
-        global MODEL
-        MODEL = active_model
-        log(f"✅ Connected — model: `{MODEL}`")
+        log(f"✅ Connected — model: `{active_model}`")
 
         # 2. Render PDF
         status_box.info("📄 Rendering PDF…")
@@ -578,7 +574,7 @@ if run_btn and uploaded:
 
             img_bytes = pil_to_bytes(page_img)
             prompt    = build_prompt(page_num, total_pages, uploaded.name)
-            result    = call_gemini(client, img_bytes, prompt)
+            result, used_model = call_gemini(client, img_bytes, prompt)
 
             ext = result.get("extracted", {})
             for k in all_ext:
@@ -595,9 +591,9 @@ if run_btn and uploaded:
             if iss_list:
                 log(f"&nbsp;&nbsp;&nbsp;⚠ {len(iss_list)} issue(s)"
                     + (f" — **{highs} HIGH**" if highs else "")
-                    + f" `[{MODEL}]`")
+                    + f" `[{used_model}]`")
             else:
-                log(f"&nbsp;&nbsp;&nbsp;✅ No issues on this page `[{MODEL}]`")
+                log(f"&nbsp;&nbsp;&nbsp;✅ No issues on this page `[{used_model}]`")
 
             if idx < total_pages - 1:
                 time.sleep(API_DELAY)
