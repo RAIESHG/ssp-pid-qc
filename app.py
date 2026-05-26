@@ -83,7 +83,14 @@ def _get_secret_key():
     except Exception:
         return os.environ.get("GEMINI_API_KEY", "")
 
-MODEL = "gemini-2.5-flash"
+# Model fallback chain — tried in order when quota/rate limit is hit
+MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.0-flash",
+]
+MODEL = MODELS[0]   # tracks active model during a run
+
 MAX_TILE_DIM    = 2200
 TILE_OVERLAP    = 0.10
 API_DELAY       = 7.0
@@ -209,38 +216,46 @@ Return ONLY raw valid JSON, no markdown, no fences:
 If page is blank/border only: {{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[]}}"""
 
 # ─── CORE: GEMINI API CALL ────────────────────────────────────────────────────
-def call_gemini(client, img_bytes, prompt, retries=3):
-    for attempt in range(retries):
-        try:
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                    types.Part.from_text(text=prompt),
-                ]
-            )
-            raw = resp.text.strip().replace("```json","").replace("```","").strip()
-            s = raw.find("{"); e = raw.rfind("}")
-            if s == -1: raise ValueError("No JSON in response")
-            return json.loads(raw[s:e+1])
+def call_gemini(client, img_bytes, prompt, retries=2):
+    """Try each model in MODELS; on quota exhaustion fall through to the next."""
+    global MODEL
+    empty = {"extracted":{}, "issues":[]}
 
-        except json.JSONDecodeError as ex:
-            if attempt < retries-1:
-                time.sleep(4)
-            else:
-                return {"extracted":{}, "issues":[]}
+    for model in MODELS:
+        MODEL = model   # keep track of active model for display/export
+        for attempt in range(retries):
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                        types.Part.from_text(text=prompt),
+                    ]
+                )
+                raw = resp.text.strip().replace("```json","").replace("```","").strip()
+                s = raw.find("{"); e = raw.rfind("}")
+                if s == -1: raise ValueError("No JSON in response")
+                return json.loads(raw[s:e+1])
 
-        except Exception as ex:
-            msg = str(ex)
-            if "429" in msg or "quota" in msg.lower():
-                wait = 30 * (attempt+1)
-                time.sleep(wait)
-            elif attempt < retries-1:
-                time.sleep(5)
-            else:
-                return {"extracted":{}, "issues":[]}
+            except json.JSONDecodeError:
+                if attempt < retries - 1:
+                    time.sleep(4)
+                else:
+                    return empty   # bad JSON even after retry — skip tile
 
-    return {"extracted":{}, "issues":[]}
+            except Exception as ex:
+                msg = str(ex)
+                is_quota = ("429" in msg or "quota" in msg.lower()
+                            or "exhausted" in msg.lower() or "RESOURCE_EXHAUSTED" in msg)
+                if is_quota:
+                    # Break inner loop → try next model
+                    break
+                elif attempt < retries - 1:
+                    time.sleep(5)
+                else:
+                    return empty   # non-quota error, give up
+
+    return empty   # all models exhausted
 
 # ─── CORE: DEDUPLICATION ──────────────────────────────────────────────────────
 def dedupe_issues(issues):
@@ -518,11 +533,25 @@ if run_btn and uploaded:
         )
 
     try:
-        # 1. Connect to Gemini
+        # 1. Connect to Gemini — test primary model, fall back silently if needed
         status_box.info("🔌 Connecting to Gemini…")
         log("🔌 Connecting to Gemini API…")
         client = genai.Client(api_key=api_key)
-        client.models.generate_content(model=MODEL, contents="Reply OK only.")
+        active_model = None
+        for m in MODELS:
+            try:
+                client.models.generate_content(model=m, contents="Reply OK only.")
+                active_model = m
+                break
+            except Exception as ex:
+                if "429" in str(ex) or "quota" in str(ex).lower() or "exhausted" in str(ex).lower():
+                    log(f"⚠ `{m}` quota exhausted — trying next model…")
+                else:
+                    raise
+        if not active_model:
+            raise RuntimeError("All models exhausted or unavailable. Try again later.")
+        global MODEL
+        MODEL = active_model
         log(f"✅ Connected — model: `{MODEL}`")
 
         # 2. Render PDF
@@ -565,9 +594,10 @@ if run_btn and uploaded:
             highs = sum(1 for i in iss_list if i.get("severity")=="HIGH")
             if iss_list:
                 log(f"&nbsp;&nbsp;&nbsp;⚠ {len(iss_list)} issue(s)"
-                    + (f" — **{highs} HIGH**" if highs else ""))
+                    + (f" — **{highs} HIGH**" if highs else "")
+                    + f" `[{MODEL}]`")
             else:
-                log("&nbsp;&nbsp;&nbsp;✅ No issues on this page")
+                log(f"&nbsp;&nbsp;&nbsp;✅ No issues on this page `[{MODEL}]`")
 
             if idx < total_pages - 1:
                 time.sleep(API_DELAY)
