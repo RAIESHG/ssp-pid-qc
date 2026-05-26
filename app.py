@@ -76,8 +76,14 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-DEFAULT_API_KEY = "AIzaSyBaOhP2_7nftkRCJzTfkHZsJ6mUDwRBtF0"
-MODEL           = "gemini-2.5-flash"
+# API key priority: Streamlit secrets → environment variable → sidebar input
+def _get_default_key():
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return os.environ.get("GEMINI_API_KEY", "")
+
+MODEL = "gemini-2.5-flash"
 MAX_TILE_DIM    = 2200
 TILE_OVERLAP    = 0.10
 API_DELAY       = 7.0
@@ -379,12 +385,16 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
 
+    _default_key = _get_default_key()
     api_key = st.text_input(
         "Gemini API Key",
-        value=DEFAULT_API_KEY,
+        value=_default_key,
         type="password",
-        help="Get a free key at aistudio.google.com/app/apikey",
+        placeholder="Paste key if not set in secrets",
+        help="Set GEMINI_API_KEY in Streamlit Cloud secrets, or paste here.",
     )
+    if _default_key:
+        st.caption("✅ Key loaded from secrets/environment.")
 
     st.markdown("---")
     st.markdown("### 📋 Drawing Metadata")
