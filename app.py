@@ -193,13 +193,8 @@ MEDIUM = Untagged instrument | PCV no loop | X\" utility | Incomplete datasheet
 LOW    = Title block / note omission
 INFO   = Stage observation
 
-━━━ CRITICAL: PIXEL COORDINATES ━━━
-For EACH issue found, estimate the pixel coordinates (x, y) of where the error is located in the image.
-Use the image dimensions to estimate: x ranges from 0 (left) to image_width (right), y ranges from 0 (top) to image_height (bottom).
-Place coordinates at the CENTER of the problematic element (tag, line, valve, etc).
-
 Return ONLY raw valid JSON, no markdown, no fences:
-{{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[{{"severity":"HIGH","category":"Tagging","element":"exact element","issue":"specific problem","recommendation":"specific fix","x":150,"y":200}}]}}
+{{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[{{"severity":"HIGH","category":"Tagging","element":"exact element","issue":"specific problem","recommendation":"specific fix"}}]}}
 
 If tile is blank/border only: {{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[]}}"""
 
@@ -371,10 +366,9 @@ def export_excel_bytes(issues, extracted, meta):
 
 
 # ─── OUTPUT: MARKED-UP PDF EXPORT (returns bytes) ─────────────────────────────
-def export_pdf_markup_bytes(issues, original_pdf_bytes, tiles_info, dpi=250):
-    """Create a visually marked-up PDF (as bytes) by overlaying issue markers
-    at the exact pixel coordinates where errors were found. tiles_info contains
-    the tile metadata (page, label, offset) needed to map tile coords to page coords.
+def export_pdf_markup_bytes(issues, original_pdf_bytes, dpi=250):
+    """Create a visually marked-up PDF (as bytes) by adding colored severity badges
+    and issue summaries at the bottom of each page, grouped by tile/area.
     """
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(original_pdf_bytes)
@@ -393,28 +387,36 @@ def export_pdf_markup_bytes(issues, original_pdf_bytes, tiles_info, dpi=250):
         page_issues = [i for i in issues if int(i.get("page", 1)) == pn]
 
         if page_issues:
-            for iss in page_issues:
+            w, h = img.size
+            margin = 12
+            box_h = 24
+            box_spacing = 4
+
+            y_offset = h - (len(page_issues) * (box_h + box_spacing)) - margin - 20
+            y_offset = max(margin, y_offset)
+
+            for idx, iss in enumerate(page_issues, start=1):
                 sev = (iss.get("severity") or "INFO").upper()
                 color = SEV_COLORS.get(sev, "#2DCA72")
+                category = iss.get("category", "")
+                element = iss.get("element", "")[:20]
 
-                x = iss.get("x")
-                y = iss.get("y")
+                y = y_offset + idx * (box_h + box_spacing)
 
-                if x is not None and y is not None:
-                    x, y = int(x), int(y)
-                    radius = 35
+                draw.rectangle(
+                    [(margin, y), (w - margin, y + box_h)],
+                    fill=color + "CC",
+                    outline=color,
+                    width=2
+                )
 
-                    draw.ellipse(
-                        [(x - radius, y - radius), (x + radius, y + radius)],
-                        outline=color,
-                        width=3
-                    )
+                text = f"{idx}. {sev} | {category}"
+                if element:
+                    text += f" | {element}"
+                if len(text) > 90:
+                    text = text[:87] + "..."
 
-                    draw.ellipse(
-                        [(x - radius + 2, y - radius + 2), (x + radius - 2, y + radius - 2)],
-                        outline=color,
-                        width=1
-                    )
+                draw.text((margin + 6, y + 4), text, fill="#000000", font=font)
 
         out_images.append(img.convert("RGB"))
 
@@ -549,7 +551,6 @@ if run_btn and uploaded:
         all_issues = []
         all_ext    = {k:[] for k in ["equipment_tags","line_numbers","instrument_tags",
                                       "valve_tags","pipe_specs","placeholder_sizes"]}
-        tiles_info = []
 
         for idx, (page_num, tile_label, tile_img) in enumerate(tiles):
             pct = idx / len(tiles)
@@ -574,12 +575,6 @@ if run_btn and uploaded:
                 if isinstance(iss, dict) and iss.get("issue"):
                     all_issues.append({**iss, "file": uploaded.name,
                                        "page": page_num, "tile": tile_label})
-
-            tiles_info.append({
-                "page": page_num,
-                "label": tile_label,
-                "size": tile_img.size,
-            })
 
             highs = sum(1 for i in iss_list if i.get("severity")=="HIGH")
             if iss_list:
@@ -612,7 +607,6 @@ if run_btn and uploaded:
             "pdf":        pdf_bytes,
             "json":       json_bytes,
             "filename":   Path(uploaded.name).stem,
-            "tiles_info": tiles_info,
         }
         status_box.success(f"✅ Analysis complete — {len(all_issues)} unique issues found.")
         log(f"<br>✅ **Done.** {len(all_issues)} unique issues after deduplication.")
@@ -654,7 +648,7 @@ if R:
     base = f"SSP_QC_{meta['drawing']}_{date.today().isoformat()}"
     dl1.download_button(
         "⬇ Download Marked-up PDF",
-        data=export_pdf_markup_bytes(R.get("issues",[]), R.get("pdf", b""), R.get("tiles_info", []), dpi=dpi),
+        data=export_pdf_markup_bytes(R.get("issues",[]), R.get("pdf", b""), dpi=dpi),
         file_name=f"{base}.pdf",
         mime="application/pdf",
         use_container_width=True,
