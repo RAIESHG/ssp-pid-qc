@@ -1,0 +1,6 @@
+streamlit
+google-genai
+pdf2image
+pillow
+openpyxl
+pandas
