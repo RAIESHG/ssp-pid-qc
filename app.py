@@ -70,7 +70,7 @@ if missing:
 from google import genai
 from google.genai import types
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -364,6 +364,58 @@ def export_excel_bytes(issues, extracted, meta):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.getvalue()
 
+
+# ─── OUTPUT: MARKED-UP PDF EXPORT (returns bytes) ─────────────────────────────
+def export_pdf_markup_bytes(issues, original_pdf_bytes, dpi=250):
+    """Create a visually marked-up PDF (as bytes) by overlaying issue markers
+    onto page images. This does not change analysis logic; it only annotates
+    the original PDF pages with simple labels for each issue found on a page.
+    """
+    # write original PDF to temp file for pdf2image
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(original_pdf_bytes)
+        tmp = f.name
+    try:
+        pages = convert_from_path(tmp, dpi=dpi)
+    finally:
+        try: os.unlink(tmp)
+        except Exception: pass
+
+    font = ImageFont.load_default()
+    out_images = []
+    for pn, img in enumerate(pages, start=1):
+        draw = ImageDraw.Draw(img, "RGBA")
+        page_issues = [i for i in issues if int(i.get("page", 1)) == pn]
+        if page_issues:
+            # Draw a right-hand stack of markers with severity color
+            w, h = img.size
+            box_w = min(360, int(w * 0.28))
+            x0 = w - box_w - 12
+            y = 12
+            for idx, iss in enumerate(page_issues, start=1):
+                sev = (iss.get("severity") or "INFO").upper()
+                color = SEV_COLORS.get(sev, "#2DCA72")
+                rect_h = 28
+                # semi-opaque background
+                draw.rectangle([(x0, y), (w-12, y+rect_h)], fill=color + "99")
+                text = f"{idx}. {sev} — {iss.get('category','')}"
+                # truncate if too long
+                if len(text) > 80:
+                    text = text[:77] + "..."
+                draw.text((x0+8, y+6), text, fill="#000000", font=font)
+                y += rect_h + 8
+
+        out_images.append(img.convert("RGB"))
+
+    buf = io.BytesIO()
+    if out_images:
+        out_images[0].save(buf, format="PDF", save_all=True, append_images=out_images[1:])
+    else:
+        # fallback: return original bytes
+        return original_pdf_bytes
+    buf.seek(0)
+    return buf.getvalue()
+
 # ─── SESSION STATE INIT ───────────────────────────────────────────────────────
 for key, default in [
     ("results", None),
@@ -540,6 +592,7 @@ if run_btn and uploaded:
             "extracted":  all_ext,
             "meta":       meta,
             "xlsx":       xlsx_bytes,
+            "pdf":        pdf_bytes,
             "json":       json_bytes,
             "filename":   Path(uploaded.name).stem,
         }
@@ -582,10 +635,10 @@ if R:
     dl1, dl2, _ = st.columns([1, 1, 3])
     base = f"SSP_QC_{meta['drawing']}_{date.today().isoformat()}"
     dl1.download_button(
-        "⬇ Download Excel Report",
-        data=R["xlsx"],
-        file_name=f"{base}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇ Download Marked-up PDF",
+        data=export_pdf_markup_bytes(R.get("issues",[]), R.get("pdf", b""), dpi=dpi),
+        file_name=f"{base}.pdf",
+        mime="application/pdf",
         use_container_width=True,
     )
     dl2.download_button(
