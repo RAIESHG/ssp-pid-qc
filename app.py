@@ -129,22 +129,26 @@ def pdf_to_tiles(pdf_bytes: bytes, dpi: int = 250):
 
     return tiles, len(pages)
 
+def pdf_to_full_pages(pdf_bytes: bytes, dpi: int = 250):
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes)
+        tmp = f.name
+    try:
+        pages = convert_from_path(tmp, dpi=dpi)
+    finally:
+        os.unlink(tmp)
+    return [(pn, page) for pn, page in enumerate(pages, 1)]
+
 def pil_to_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=93)
     return buf.getvalue()
 
 # ─── CORE: PROMPT ─────────────────────────────────────────────────────────────
-def build_prompt(tile_label, page_num, total_pages, filename, is_overview):
-    focus = (
-        "This is a FULL PAGE OVERVIEW. Extract ALL visible tags, line numbers, and instrument bubbles."
-        if is_overview else
-        f"This is the {tile_label.upper()} at HIGH RESOLUTION. Read every small annotation: pipe sizes, tag numbers, instrument bubbles, valve symbols, datasheet fields."
-    )
+def build_prompt(page_num, total_pages, filename):
     return f"""You are a senior P&ID engineer at SSP Engineering & Consulting performing a QC review.
 
-DRAWING: {filename} | PAGE: {page_num}/{total_pages} | AREA: {tile_label}
-{focus}
+DRAWING: {filename} | PAGE: {page_num}/{total_pages}
 
 READ EVERY PIECE OF TEXT including very small annotations. Name exact element locations.
 
@@ -193,10 +197,16 @@ MEDIUM = Untagged instrument | PCV no loop | X\" utility | Incomplete datasheet
 LOW    = Title block / note omission
 INFO   = Stage observation
 
-Return ONLY raw valid JSON, no markdown, no fences:
-{{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[{{"severity":"HIGH","category":"Tagging","element":"exact element","issue":"specific problem","recommendation":"specific fix"}}]}}
+━━━ CRITICAL: PIXEL COORDINATES ━━━
+For EACH issue found, provide the pixel coordinates (x, y) where the error is located.
+x ranges from 0 (left edge) to image_width (right edge)
+y ranges from 0 (top edge) to image_height (bottom edge)
+Place coordinates at the CENTER of the problematic element.
 
-If tile is blank/border only: {{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[]}}"""
+Return ONLY raw valid JSON, no markdown, no fences:
+{{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[{{"severity":"HIGH","category":"Tagging","element":"exact element","issue":"specific problem","recommendation":"specific fix","x":500,"y":300}}]}}
+
+If page is blank/border only: {{"extracted":{{"equipment_tags":[],"line_numbers":[],"instrument_tags":[],"valve_tags":[],"pipe_specs":[],"placeholder_sizes":[]}},"issues":[]}}"""
 
 # ─── CORE: GEMINI API CALL ────────────────────────────────────────────────────
 def call_gemini(client, img_bytes, prompt, retries=3):
@@ -367,9 +377,7 @@ def export_excel_bytes(issues, extracted, meta):
 
 # ─── OUTPUT: MARKED-UP PDF EXPORT (returns bytes) ─────────────────────────────
 def export_pdf_markup_bytes(issues, original_pdf_bytes, dpi=250):
-    """Create a visually marked-up PDF (as bytes) by adding colored severity badges
-    and issue summaries at the bottom of each page, grouped by tile/area.
-    """
+    """Draw circles at exact error coordinates on PDF pages."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(original_pdf_bytes)
         tmp = f.name
@@ -379,44 +387,24 @@ def export_pdf_markup_bytes(issues, original_pdf_bytes, dpi=250):
         try: os.unlink(tmp)
         except Exception: pass
 
-    font = ImageFont.load_default()
     out_images = []
-
     for pn, img in enumerate(pages, start=1):
         draw = ImageDraw.Draw(img, "RGBA")
         page_issues = [i for i in issues if int(i.get("page", 1)) == pn]
 
-        if page_issues:
-            w, h = img.size
-            margin = 12
-            box_h = 24
-            box_spacing = 4
-
-            y_offset = h - (len(page_issues) * (box_h + box_spacing)) - margin - 20
-            y_offset = max(margin, y_offset)
-
-            for idx, iss in enumerate(page_issues, start=1):
+        for iss in page_issues:
+            x = iss.get("x")
+            y = iss.get("y")
+            if x is not None and y is not None:
                 sev = (iss.get("severity") or "INFO").upper()
                 color = SEV_COLORS.get(sev, "#2DCA72")
-                category = iss.get("category", "")
-                element = iss.get("element", "")[:20]
+                x, y = int(x), int(y)
+                radius = 40
 
-                y = y_offset + idx * (box_h + box_spacing)
-
-                draw.rectangle(
-                    [(margin, y), (w - margin, y + box_h)],
-                    fill=color + "CC",
-                    outline=color,
-                    width=2
-                )
-
-                text = f"{idx}. {sev} | {category}"
-                if element:
-                    text += f" | {element}"
-                if len(text) > 90:
-                    text = text[:87] + "..."
-
-                draw.text((margin + 6, y + 4), text, fill="#000000", font=font)
+                draw.ellipse([(x-radius, y-radius), (x+radius, y+radius)],
+                            outline=color, width=4)
+                draw.ellipse([(x-radius+3, y-radius+3), (x+radius-3, y+radius-3)],
+                            outline=color, width=1)
 
         out_images.append(img.convert("RGB"))
 
@@ -541,27 +529,26 @@ if run_btn and uploaded:
         status_box.info("📄 Rendering PDF…")
         log(f"📄 Rendering PDF at {dpi} DPI…")
         pdf_bytes = uploaded.read()
-        tiles, total_pages = pdf_to_tiles(pdf_bytes, dpi=dpi)
-        log(f"✅ {total_pages} page(s) → {len(tiles)} tiles to analyze")
-        est = len(tiles) * API_DELAY
+        full_pages = pdf_to_full_pages(pdf_bytes, dpi=dpi)
+        total_pages = len(full_pages)
+        log(f"✅ {total_pages} page(s) to analyze")
+        est = total_pages * API_DELAY
         log(f"⏱ Estimated time: ~{est/60:.1f} min (free-tier pacing)")
 
-        # 3. Analyze tiles
-        status_box.info("🔍 Analyzing tiles…")
+        # 3. Analyze full pages
+        status_box.info("🔍 Analyzing pages…")
         all_issues = []
         all_ext    = {k:[] for k in ["equipment_tags","line_numbers","instrument_tags",
                                       "valve_tags","pipe_specs","placeholder_sizes"]}
 
-        for idx, (page_num, tile_label, tile_img) in enumerate(tiles):
-            pct = idx / len(tiles)
+        for idx, (page_num, page_img) in enumerate(full_pages):
+            pct = idx / total_pages
             progress_bar.progress(pct)
-            is_ov = (tile_label == "full-page overview")
 
-            log(f"<br>🖼 [{idx+1}/{len(tiles)}] Page {page_num} — **{tile_label}** {tile_img.size}")
+            log(f"<br>🖼 [{idx+1}/{total_pages}] Page {page_num} {page_img.size}")
 
-            img_bytes = pil_to_bytes(tile_img)
-            prompt    = build_prompt(tile_label, page_num, total_pages,
-                                     uploaded.name, is_ov)
+            img_bytes = pil_to_bytes(page_img)
+            prompt    = build_prompt(page_num, total_pages, uploaded.name)
             result    = call_gemini(client, img_bytes, prompt)
 
             ext = result.get("extracted", {})
@@ -573,17 +560,16 @@ if run_btn and uploaded:
             if not isinstance(iss_list, list): iss_list = []
             for iss in iss_list:
                 if isinstance(iss, dict) and iss.get("issue"):
-                    all_issues.append({**iss, "file": uploaded.name,
-                                       "page": page_num, "tile": tile_label})
+                    all_issues.append({**iss, "file": uploaded.name, "page": page_num})
 
             highs = sum(1 for i in iss_list if i.get("severity")=="HIGH")
             if iss_list:
                 log(f"&nbsp;&nbsp;&nbsp;⚠ {len(iss_list)} issue(s)"
                     + (f" — **{highs} HIGH**" if highs else ""))
             else:
-                log("&nbsp;&nbsp;&nbsp;✅ No issues in this tile")
+                log("&nbsp;&nbsp;&nbsp;✅ No issues on this page")
 
-            if idx < len(tiles) - 1:
+            if idx < total_pages - 1:
                 time.sleep(API_DELAY)
 
         progress_bar.progress(1.0)
